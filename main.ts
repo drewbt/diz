@@ -218,8 +218,6 @@ function htmlLayout(title: string, content: string, user?: any): string {
 function homePageHTML(): string {
     return htmlLayout("Welcome to Diz (Basic Demo)", `
         <p>This is a simplified demonstration of the basic token allocation and transfer logic of the Diz system, built with Deno Deploy and Deno KV.</p>
-        <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
-        <p>This version implements basic rate limiting to deter brute-force login attempts.</p>
         <p>It illustrates:</p>
         <ul>
             <li>User Signup with SHA-256 Hashing & Salting & Basic Allocation</li>
@@ -236,7 +234,6 @@ function homePageHTML(): string {
 function signupFormHTML(error?: string): string {
     return htmlLayout("Signup", `
         <p>Create your account to receive your initial basic allowance.</p>
-        <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
         ${error ? `<p class="error">${error}</p>` : ''}
         <form action="/signup" method="post">
             <div>
@@ -259,7 +256,6 @@ function signupFormHTML(error?: string): string {
 function loginFormHTML(error?: string): string {
     return htmlLayout("Login", `
         <p>Log in to access your dashboard and receive your monthly allowance.</p>
-         <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
         ${error ? `<p class="error">${error}</p>` : ''}
         <form action="/login" method="post">
             <div>
@@ -548,7 +544,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
                     message = `Recipient '${recipientUsername}' not found.`;
                 }
                 else if (user.balance_parts < amountParts) {
-                    message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
+                    message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARIFIER).toFixed(3)} units.`;
                 } else {
                     user.balance_parts -= amountParts;
                     recipient.balance_parts += amountParts;
