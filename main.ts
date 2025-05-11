@@ -269,40 +269,54 @@ Deno.serve(async (req: Request): Promise<Response> => {
         }
 
         const newUserId = generateUserId(username);
-        const existingUser = await getUser(newUserId);
 
-        // Check if username already exists.
-        if (existingUser) {
-             return new Response(signupFormHTML(`Username '${username}' already exists.`), {
-                headers: { "content-type": "text/html" }, status: 400
+        try {
+            const existingUser = await getUser(newUserId);
+
+            // Check if username already exists.
+            if (existingUser) {
+                 return new Response(signupFormHTML(`Username '${username}' already exists.`), {
+                    headers: { "content-type": "text/html" }, status: 400
+                });
+            }
+
+            // --- Secure Password Handling: Hash the password ---
+            // Use bcrypt to hash the user's password before storing it.
+            const hashedPassword = await bcrypt.hash(password);
+            // --- End of Secure Handling ---
+
+            // Create the new user object.
+            user = {
+                id: newUserId,
+                username: username,
+                password_hash: hashedPassword, // Store the hash, NOT the plaintext password.
+                balance_parts: BASIC_ALLOCATION_PARTS, // Allocate initial basic needs tokens.
+                last_allocation_timestamp: Date.now(), // Record time of first allocation.
+            };
+            await saveUser(user.id, user); // Save the new user to KV.
+
+            // Record the initial allocation transaction from the system.
+            await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
+
+            // Set a cookie to keep the user logged in for this demo session.
+            const headers = new Headers();
+            headers.set("content-type", "text/html");
+            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
+
+            // Redirect the user to the dashboard after successful signup.
+             return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
+
+        } catch (error) {
+            // Catch any errors during signup process (KV, bcrypt, etc.)
+            console.error("Error during signup:", error);
+            return new Response(htmlLayout("Error", `
+                <p class="error">An internal server error occurred during signup. Please try again later.</p>
+                <p><a href="/signup">Back to Signup</a></p>
+            `), {
+                headers: { "content-type": "text/html" },
+                status: 500 // Internal Server Error
             });
         }
-
-        // --- Secure Password Handling: Hash the password ---
-        // Use bcrypt to hash the user's password before storing it.
-        const hashedPassword = await bcrypt.hash(password);
-        // --- End of Secure Handling ---
-
-        // Create the new user object.
-        user = {
-            id: newUserId,
-            username: username,
-            password_hash: hashedPassword, // Store the hash, NOT the plaintext password.
-            balance_parts: BASIC_ALLOCATION_PARTS, // Allocate initial basic needs tokens.
-            last_allocation_timestamp: Date.now(), // Record time of first allocation.
-        };
-        await saveUser(user.id, user); // Save the new user to KV.
-
-        // Record the initial allocation transaction from the system.
-        await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
-
-        // Set a cookie to keep the user logged in for this demo session.
-        const headers = new Headers();
-        headers.set("content-type", "text/html");
-        headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
-
-        // Redirect the user to the dashboard after successful signup.
-         return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
 
     } else if (url.pathname === "/login" && req.method === "GET") {
@@ -328,47 +342,61 @@ Deno.serve(async (req: Request): Promise<Response> => {
         }
 
         const loginUserId = generateUserId(username);
-        user = await getUser(loginUserId);
 
-        // Check if user exists.
-        if (!user) {
-            return new Response(loginFormHTML("Invalid username or password."), {
-                headers: { "content-type": "text/html" }, status: 401
+        try {
+            user = await getUser(loginUserId);
+
+            // Check if user exists.
+            if (!user) {
+                return new Response(loginFormHTML("Invalid username or password."), {
+                    headers: { "content-type": "text/html" }, status: 401
+                });
+            }
+
+            // --- Secure Password Handling: Compare password against the stored hash ---
+            // Use bcrypt.compare to securely verify the submitted password against the stored hash.
+            const passwordMatch = await bcrypt.compare(password, user.password_hash);
+
+            // If passwords do not match, return an error.
+            if (!passwordMatch) {
+                return new Response(loginFormHTML("Invalid username or password."), {
+                    headers: { "content-type": "text/html" }, status: 401
+                });
+            }
+             // --- End of Secure Handling ---
+
+            // Check for monthly allocation on first login of the month.
+            // If enough time has passed since the last allocation, add the basic allocation.
+            if (Date.now() - user.last_allocation_timestamp > ONE_MONTH_MS) {
+                user.balance_parts += BASIC_ALLOCATION_PARTS;
+                user.last_allocation_timestamp = Date.now();
+                await saveUser(user.id, user); // Save the updated user data.
+                await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation'); // Record the allocation transaction.
+                allocationMessage = "Monthly allowance received!"; // Set message for dashboard display.
+            }
+
+            // Set a cookie to keep the user logged in for this demo session.
+            const headers = new Headers();
+            headers.set("content-type", "text/html");
+            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
+
+             // Redirect to the dashboard after successful login.
+             // Pass the allocation message via URL parameter for simplicity in this demo.
+             const redirectUrl = new URL('/dashboard', req.url);
+             if(allocationMessage) redirectUrl.searchParams.set('msg', encodeURIComponent(allocationMessage));
+             return Response.redirect(redirectUrl.toString(), 302);
+
+        } catch (error) {
+             // Catch any errors during login process (KV, bcrypt, etc.)
+            console.error("Error during login:", error);
+            return new Response(htmlLayout("Error", `
+                <p class="error">An internal server error occurred during login. Please try again later.</p>
+                <p><a href="/login">Back to Login</a></p>
+            `), {
+                headers: { "content-type": "text/html" },
+                status: 500 // Internal Server Error
             });
         }
-
-        // --- Secure Password Handling: Compare password against the stored hash ---
-        // Use bcrypt.compare to securely verify the submitted password against the stored hash.
-        const passwordMatch = await bcrypt.compare(password, user.password_hash);
-
-        // If passwords do not match, return an error.
-        if (!passwordMatch) {
-            return new Response(loginFormHTML("Invalid username or password."), {
-                headers: { "content-type": "text/html" }, status: 401
-            });
-        }
-         // --- End of Secure Handling ---
-
-        // Check for monthly allocation on first login of the month.
-        // If enough time has passed since the last allocation, add the basic allocation.
-        if (Date.now() - user.last_allocation_timestamp > ONE_MONTH_MS) {
-            user.balance_parts += BASIC_ALLOCATION_PARTS;
-            user.last_allocation_timestamp = Date.now();
-            await saveUser(user.id, user); // Save the updated user data.
-            await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation'); // Record the allocation transaction.
-            allocationMessage = "Monthly allowance received!"; // Set message for dashboard display.
-        }
-
-        // Set a cookie to keep the user logged in for this demo session.
-        const headers = new Headers();
-        headers.set("content-type", "text/html");
-        headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
-
-         // Redirect to the dashboard after successful login.
-         // Pass the allocation message via URL parameter for simplicity in this demo.
-         const redirectUrl = new URL('/dashboard', req.url);
-         if(allocationMessage) redirectUrl.searchParams.set('msg', encodeURIComponent(allocationMessage));
-         return Response.redirect(redirectUrl.toString(), 302);
 
 
     } else if (url.pathname === "/logout" && req.method === "GET") {
@@ -382,17 +410,30 @@ Deno.serve(async (req: Request): Promise<Response> => {
         // Serve the user dashboard. Redirect to login if not logged in.
         if (!user) return Response.redirect(new URL('/login', req.url).toString(), 302);
 
-        // Fetch the user's transaction history for the "Transaction River".
-        const transactions = await getUserTransactions(user.id);
+        try {
+            // Fetch the user's transaction history for the "Transaction River".
+            const transactions = await getUserTransactions(user.id);
 
-        // Check for allocation message passed from login redirect URL parameter.
-        const msg = url.searchParams.get('msg');
-        if (msg) allocationMessage = decodeURIComponent(msg);
+            // Check for allocation message passed from login redirect URL parameter.
+            const msg = url.searchParams.get('msg');
+            if (msg) allocationMessage = decodeURIComponent(msg);
 
-        // Serve the dashboard HTML with user data and transactions.
-        return new Response(dashboardHTML(user, transactions, allocationMessage), {
-            headers: { "content-type": "text/html" },
-        });
+            // Serve the dashboard HTML with user data and transactions.
+            return new Response(dashboardHTML(user, transactions, allocationMessage), {
+                headers: { "content-type": "text/html" },
+            });
+        } catch (error) {
+             // Catch any errors fetching transactions.
+            console.error("Error fetching transactions:", error);
+             return new Response(htmlLayout("Error", `
+                <p class="error">An internal server error occurred while loading your dashboard.</p>
+                <p><a href="/">Go to Home</a></p>
+            `), {
+                headers: { "content-type": "text/html" },
+                status: 500 // Internal Server Error
+            });
+        }
+
 
     } else if (url.pathname === "/send" && req.method === "POST") {
         // Handle sending tokens between users. Redirect to login if not logged in.
@@ -411,39 +452,45 @@ Deno.serve(async (req: Request): Promise<Response> => {
         if (!recipientUsername || amountUnits <= 0 || !Number.isInteger(amountParts) || amountParts <= 0) {
             message = "Invalid recipient or amount.";
         } else {
-            const recipientUserId = generateUserId(recipientUsername);
-            const recipient = await getUser(recipientUserId);
+            try {
+                const recipientUserId = generateUserId(recipientUsername);
+                const recipient = await getUser(recipientUserId);
 
-            // Check if recipient exists.
-            if (!recipient) {
-                message = `Recipient '${recipientUsername}' not found.`;
-            }
-            // Check if sender has sufficient balance.
-            else if (user.balance_parts < amountParts) {
-                message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
-            } else {
-                // --- Perform the Token Transfer ---
-                // Deduct from sender and add to recipient.
-                user.balance_parts -= amountParts;
-                recipient.balance_parts += amountParts;
-
-                // Use a KV atomic transaction to ensure both balance updates succeed or fail together.
-                const ok = await kv.atomic()
-                    .mutate(
-                        { key: ["users", user.id], value: user },
-                        { key: ["users", recipient.id], value: recipient }
-                    )
-                    .commit();
-
-                if (ok.ok) {
-                    // If the atomic update was successful, record the transaction for both users.
-                    await recordTransaction(user.id, recipient.id, amountParts, 'send');
-                    message = `Successfully sent ${amountUnits.toFixed(3)} units to ${recipientUsername}.`;
-                    success = true;
-                } else {
-                    // Handle atomic commit failure.
-                    message = "Transaction failed (atomic commit error).";
+                // Check if recipient exists.
+                if (!recipient) {
+                    message = `Recipient '${recipientUsername}' not found.`;
                 }
+                // Check if sender has sufficient balance.
+                else if (user.balance_parts < amountParts) {
+                    message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
+                } else {
+                    // --- Perform the Token Transfer ---
+                    // Deduct from sender and add to recipient.
+                    user.balance_parts -= amountParts;
+                    recipient.balance_parts += amountParts;
+
+                    // Use a KV atomic transaction to ensure both balance updates succeed or fail together.
+                    const ok = await kv.atomic()
+                        .mutate(
+                            { key: ["users", user.id], value: user },
+                            { key: ["users", recipient.id], value: recipient }
+                        )
+                        .commit();
+
+                    if (ok.ok) {
+                        // If the atomic update was successful, record the transaction for both users.
+                        await recordTransaction(user.id, recipient.id, amountParts, 'send');
+                        message = `Successfully sent ${amountUnits.toFixed(3)} units to ${recipientUsername}.`;
+                        success = true;
+                    } else {
+                        // Handle atomic commit failure.
+                        message = "Transaction failed (atomic commit error).";
+                    }
+                }
+            } catch (error) {
+                 // Catch any errors during send process (KV, etc.)
+                console.error("Error during send:", error);
+                message = "An internal server error occurred during the transaction.";
             }
         }
 
