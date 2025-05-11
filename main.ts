@@ -1,12 +1,11 @@
-// main.ts - Basic Token Allocation System for Deno Deploy (with Secure Password Hashing)
+// main.ts - Basic Token Allocation System for Deno Deploy (SHA-256 Hashing & Rate Limiting)
 
 // Import necessary modules
 // Using Deno.serve which is built-in and requires no external import for basic use.
-// Importing bcrypt for secure password hashing.
-import * as bcrypt from "https://deno.land/x/bcrypt@v0.4.1/mod.ts";
+// Using Deno's built-in Web Crypto API for hashing (SHA-256).
 
 // Initialize Deno KV
-// Deno KV is used for storing user data and transactions.
+// Deno KV is used for storing user data, transactions, and failed login attempts.
 const kv = await Deno.openKv();
 
 // --- Constants and Configuration ---
@@ -15,8 +14,11 @@ const UNITS_TO_PARTS_MULTIPLIER = 1000;
 const BASIC_ALLOCATION_PARTS = BASIC_ALLOCATION_UNITS * UNITS_TO_PARTS_MULTIPLIER; // 50000 parts
 
 // Approximation of a month in milliseconds for monthly allocation check.
-// In a real system, this would ideally be tied to calendar months for accuracy.
 const ONE_MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Rate Limiting Configuration
+const MAX_FAILED_ATTEMPTS = 5; // Maximum failed attempts before delay starts
+const BASE_DELAY_MS = 1000; // 1 second base delay
 
 // --- Helper Functions ---
 
@@ -39,45 +41,142 @@ async function saveUser(userId: string, userData: any): Promise<void> {
 }
 
 // Gets transactions for a specific user from KV.
-// Transactions are stored indexed by user ID and timestamp for retrieval.
 async function getUserTransactions(userId: string): Promise<any[]> {
-    // List all transactions with the prefix for this user ID.
     const iter = kv.list({ prefix: ["transactions", userId] });
     const transactions = [];
     for await (const entry of iter) {
         transactions.push(entry.value);
     }
-    // Sort transactions by timestamp to ensure chronological order for the "river" display.
     transactions.sort((a, b) => a.timestamp - b.timestamp);
     return transactions;
 }
 
 // Records a transaction in KV.
-// A transaction object is stored for both the sender and recipient (if applicable)
-// to facilitate easy retrieval for both users' transaction history.
 async function recordTransaction(fromUserId: string, toUserId: string, amountParts: number, type: 'allocation' | 'send' | 'receive'): Promise<void> {
     const transaction = {
-        id: crypto.randomUUID(), // Unique transaction ID
-        from: fromUserId, // User ID the tokens came from ('system' for allocation)
-        to: toUserId,   // User ID the tokens went to
-        amount_parts: amountParts, // Amount in the smallest unit (parts)
-        type: type, // Type of transaction ('allocation', 'send', 'receive')
-        timestamp: Date.now(), // Timestamp for ordering - simulates "appended to stack"
-        // In a real system, this would be a serialized Protocol Buffer binary data.
-        // For this demo, it's a JS object stored in KV.
+        id: crypto.randomUUID(),
+        from: fromUserId,
+        to: toUserId,
+        amount_parts: amountParts,
+        type: type,
+        timestamp: Date.now(),
     };
-
-    // Store the transaction, indexed by the 'from' user and timestamp.
     await kv.set(["transactions", fromUserId, transaction.timestamp + "_out"], transaction);
-    // Store the transaction, indexed by the 'to' user and timestamp.
     await kv.set(["transactions", toUserId, transaction.timestamp + "_in"], transaction);
 }
 
+// Generates a random salt for password hashing.
+async function generateSalt(): Promise<Uint8Array> {
+    return crypto.getRandomValues(new Uint8Array(16)); // 16 bytes is a common salt size
+}
+
+// Hashes a password using SHA-256 with a salt.
+// Returns the salt and the hash.
+async function hashPassword(password: string, salt: Uint8Array): Promise<string> {
+    // Combine salt and password
+    const textEncoder = new TextEncoder();
+    const passwordBytes = textEncoder.encode(password);
+    const saltedPassword = new Uint8Array(salt.length + passwordBytes.length);
+    saltedPassword.set(salt, 0);
+    saltedPassword.set(passwordBytes, salt.length);
+
+    // Hash the salted password using SHA-256
+    const hashBuffer = await crypto.subtle.digest('SHA-256', saltedPassword);
+
+    // Convert the hash buffer to a hex string
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Return the salt (as hex) and the hash (as hex), combined for storage
+    const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
+    return saltHex + ':' + hashHex; // Store salt and hash separated by a colon
+}
+
+// Verifies a password against a stored salt and hash.
+async function verifyPassword(password: string, storedSaltAndHash: string): Promise<boolean> {
+    try {
+        const [saltHex, storedHashHex] = storedSaltAndHash.split(':');
+        if (!saltHex || !storedHashHex) return false;
+
+        // Convert salt hex back to Uint8Array
+        const salt = new Uint8Array(saltHex.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16)));
+
+        // Hash the provided password with the stored salt
+        const textEncoder = new TextEncoder();
+        const passwordBytes = textEncoder.encode(password);
+        const saltedPassword = new Uint8Array(salt.length + passwordBytes.length);
+        saltedPassword.set(salt, 0);
+        saltedPassword.set(passwordBytes, salt.length);
+
+        const hashBuffer = await crypto.subtle.digest('SHA-256', saltedPassword);
+
+        // Convert the newly generated hash buffer to a hex string
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        const newHashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+        // Compare the newly generated hash hex with the stored hash hex
+        // Use a constant-time comparison if possible to prevent timing attacks,
+        // but simple string comparison is acceptable for this demo's purpose.
+        return newHashHex === storedHashHex;
+
+    } catch (e) {
+        console.error("Error during password verification:", e);
+        return false; // Handle potential errors during verification
+    }
+}
+
+// Gets failed login attempts data for a user.
+async function getFailedAttempts(userId: string): Promise<{ count: number, lastAttempt: number } | null> {
+    const result = await kv.get(["failed_login_attempts", userId]);
+    return result.value;
+}
+
+// Sets failed login attempts data for a user.
+async function setFailedAttempts(userId: string, count: number, lastAttempt: number): Promise<void> {
+    await kv.set(["failed_login_attempts", userId], { count, lastAttempt });
+}
+
+// Clears failed login attempts data for a user.
+async function clearFailedAttempts(userId: string): Promise<void> {
+     await kv.delete(["failed_login_attempts", userId]);
+}
+
+// Calculates the required delay based on the number of failed attempts.
+function calculateDelay(failedCount: number): number {
+    if (failedCount <= MAX_FAILED_ATTEMPTS) {
+        return 0; // No delay for first few attempts
+    }
+    // Exponential backoff: BASE_DELAY_MS * 2^(failedCount - MAX_FAILED_ATTEMPTS)
+    const delay = BASE_DELAY_MS * Math.pow(2, failedCount - MAX_FAILED_ATTEMPTS);
+    // Cap the delay to prevent excessively long waits (e.g., 1 minute max)
+    return Math.min(delay, 60000); // Max 60 seconds delay
+}
+
+// Enforces a delay if required based on failed login attempts.
+async function enforceDelay(userId: string): Promise<string | null> {
+    const failedAttempts = await getFailedAttempts(userId);
+    if (failedAttempts) {
+        const requiredDelay = calculateDelay(failedAttempts.count);
+        const timeSinceLastAttempt = Date.now() - failedAttempts.lastAttempt;
+
+        if (timeSinceLastAttempt < requiredDelay) {
+            const remainingDelay = requiredDelay - timeSinceLastAttempt;
+            // Simulate waiting (in a real system, this might involve a blocking operation or returning a "Too Many Requests" response with a Retry-After header)
+            // For this demo, we'll return a message and expect the user to wait before trying again.
+            return `Too many failed login attempts. Please wait ${Math.ceil(remainingDelay / 1000)} seconds before trying again.`;
+        } else {
+            // If enough time has passed, clear the failed attempts count for this user.
+            await clearFailedAttempts(userId);
+            return null; // No delay needed
+        }
+    }
+    return null; // No failed attempts recorded
+}
+
+
 // --- HTML Templates (Vanilla HTML) ---
-// These functions generate the HTML strings for different pages.
 
 function htmlLayout(title: string, content: string, user?: any): string {
-    // Basic HTML structure and styling.
     return `
 <!DOCTYPE html>
 <html>
@@ -98,6 +197,7 @@ function htmlLayout(title: string, content: string, user?: any): string {
         .transaction { border-bottom: 1px solid #eee; padding: 10px 0; }
         .transaction:last-child { border-bottom: none; }
         .error { color: red; font-weight: bold; }
+        .warning { color: orange; font-weight: bold; }
     </style>
 </head>
 <body>
@@ -118,11 +218,12 @@ function htmlLayout(title: string, content: string, user?: any): string {
 function homePageHTML(): string {
     return htmlLayout("Welcome to Diz (Basic Demo)", `
         <p>This is a simplified demonstration of the basic token allocation and transfer logic of the Diz system, built with Deno Deploy and Deno KV.</p>
-        <p>This version demonstrates **proper password hashing** for signup and login, addressing the crucial security concern from the previous example.</p>
+        <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
+        <p>This version implements basic rate limiting to deter brute-force login attempts.</p>
         <p>It illustrates:</p>
         <ul>
-            <li>User Signup with Secure Password Hashing & Basic Allocation</li>
-            <li>Monthly Allocation on Login (with secure password verification)</li>
+            <li>User Signup with SHA-256 Hashing & Salting & Basic Allocation</li>
+            <li>Monthly Allocation on Login (with secure password verification & rate limiting)</li>
             <li>Token Balance</li>
             <li>Sending Tokens to Others</li>
             <li>Basic Transaction History ("Transaction River")</li>
@@ -135,6 +236,7 @@ function homePageHTML(): string {
 function signupFormHTML(error?: string): string {
     return htmlLayout("Signup", `
         <p>Create your account to receive your initial basic allowance.</p>
+        <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
         ${error ? `<p class="error">${error}</p>` : ''}
         <form action="/signup" method="post">
             <div>
@@ -157,6 +259,7 @@ function signupFormHTML(error?: string): string {
 function loginFormHTML(error?: string): string {
     return htmlLayout("Login", `
         <p>Log in to access your dashboard and receive your monthly allowance.</p>
+         <p class="warning">**IMPORTANT SECURITY NOTE:** This demo uses SHA-256 hashing for passwords as requested, but this is **NOT recommended for real-world applications** due to its speed. A real system should use a dedicated, slow password hashing algorithm like bcrypt, scrypt, or Argon2.</p>
         ${error ? `<p class="error">${error}</p>` : ''}
         <form action="/login" method="post">
             <div>
@@ -173,16 +276,15 @@ function loginFormHTML(error?: string): string {
 }
 
 function dashboardHTML(user: any, transactions: any[], allocationMessage: string | null): string {
-    // Generates the HTML list for the transaction river.
     const transactionListItems = transactions.map(tx => {
         const type = tx.type === 'allocation' ? 'Received Allocation'
                    : tx.from === user.id ? `Sent to ${tx.to.replace('user_', '')}`
                    : `Received from ${tx.from.replace('user_', '')}`;
         const amount = tx.amount_parts / UNITS_TO_PARTS_MULTIPLIER;
-        const sign = tx.from === user.id ? '-' : '+'; // Indicate if tokens were sent (-) or received (+) by the current user
-        const date = new Date(tx.timestamp).toLocaleString(); // Format timestamp for display
+        const sign = tx.from === user.id ? '-' : '+';
+        const date = new Date(tx.timestamp).toLocaleString();
         return `<div class="transaction"><strong>${type}:</strong> ${sign}${amount.toFixed(3)} units on ${date}</div>`;
-    }).join(''); // Join all transaction HTML strings
+    }).join('');
 
     return htmlLayout("Dashboard", `
         ${allocationMessage ? `<p style="color: green; font-weight: bold;">${allocationMessage}</p>` : ''}
@@ -218,37 +320,28 @@ function sendResultHTML(message: string, success: boolean, user: any): string {
     `, user);
 }
 
-
 // --- Request Handler ---
-// This function handles all incoming HTTP requests.
 
 Deno.serve(async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
 
-    // Basic session management using a cookie.
-    // In a real system, use more secure session tokens/management.
     let userId = req.headers.get("cookie")?.split('; ').find(row => row.startsWith('user_id='))?.split('=')[1];
     let user = userId ? await getUser(userId) : null;
-    let allocationMessage: string | null = null; // Message for monthly allocation display
+    let allocationMessage: string | null = null;
 
-
-    // --- Handle Different Routes and HTTP Methods ---
 
     if (url.pathname === "/" && req.method === "GET") {
-        // Serve the home page.
         return new Response(homePageHTML(), {
             headers: { "content-type": "text/html" },
         });
 
     } else if (url.pathname === "/signup" && req.method === "GET") {
-         // Serve the signup form. Redirect to dashboard if already logged in.
          if (user) return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
         return new Response(signupFormHTML(), {
             headers: { "content-type": "text/html" },
         });
 
     } else if (url.pathname === "/signup" && req.method === "POST") {
-        // Handle signup form submission.
         if (user) return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
         const formData = await req.formData();
@@ -256,7 +349,6 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const password = formData.get("password")?.toString();
         const confirmPassword = formData.get("confirm_password")?.toString();
 
-        // Basic input validation.
         if (!username || !password || !confirmPassword) {
              return new Response(signupFormHTML("Username, password, and confirmation are required."), {
                 headers: { "content-type": "text/html" }, status: 400
@@ -273,68 +365,59 @@ Deno.serve(async (req: Request): Promise<Response> => {
         try {
             const existingUser = await getUser(newUserId);
 
-            // Check if username already exists.
             if (existingUser) {
                  return new Response(signupFormHTML(`Username '${username}' already exists.`), {
                     headers: { "content-type": "text/html" }, status: 400
                 });
             }
 
-            // --- Secure Password Handling: Hash the password ---
-            // Use bcrypt to hash the user's password before storing it.
-            const hashedPassword = await bcrypt.hash(password);
-            // --- End of Secure Handling ---
+            // --- Password Handling: Generate Salt and Hash using SHA-256 ---
+            const salt = await generateSalt();
+            const hashedPassword = await hashPassword(password, salt);
+            // --- End of Password Handling ---
 
-            // Create the new user object.
             user = {
                 id: newUserId,
                 username: username,
-                password_hash: hashedPassword, // Store the hash, NOT the plaintext password.
-                balance_parts: BASIC_ALLOCATION_PARTS, // Allocate initial basic needs tokens.
-                last_allocation_timestamp: Date.now(), // Record time of first allocation.
+                password_hash: hashedPassword, // Store salt and hash
+                balance_parts: BASIC_ALLOCATION_PARTS,
+                last_allocation_timestamp: Date.now(),
             };
-            await saveUser(user.id, user); // Save the new user to KV.
+            await saveUser(user.id, user);
 
-            // Record the initial allocation transaction from the system.
             await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
 
-            // Set a cookie to keep the user logged in for this demo session.
             const headers = new Headers();
             headers.set("content-type", "text/html");
             headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
 
-            // Redirect the user to the dashboard after successful signup.
              return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
         } catch (error) {
-            // Catch any errors during signup process (KV, bcrypt, etc.)
             console.error("Error during signup:", error);
             return new Response(htmlLayout("Error", `
                 <p class="error">An internal server error occurred during signup. Please try again later.</p>
                 <p><a href="/signup">Back to Signup</a></p>
             `), {
                 headers: { "content-type": "text/html" },
-                status: 500 // Internal Server Error
+                status: 500
             });
         }
 
 
     } else if (url.pathname === "/login" && req.method === "GET") {
-         // Serve the login form. Redirect to dashboard if already logged in.
          if (user) return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
         return new Response(loginFormHTML(), {
             headers: { "content-type": "text/html" },
         });
 
     } else if (url.pathname === "/login" && req.method === "POST") {
-         // Handle login form submission.
          if (user) return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
         const formData = await req.formData();
         const username = formData.get("username")?.toString();
         const password = formData.get("password")?.toString();
 
-        // Basic input validation.
         if (!username || !password) {
              return new Response(loginFormHTML("Username and password are required."), {
                 headers: { "content-type": "text/html" }, status: 400
@@ -344,111 +427,116 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const loginUserId = generateUserId(username);
 
         try {
+            // --- Rate Limiting Check ---
+            const delayMessage = await enforceDelay(loginUserId);
+            if (delayMessage) {
+                 // If a delay is enforced, record the failed attempt and return the message.
+                 const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
+                 await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
+                 return new Response(loginFormHTML(delayMessage), {
+                    headers: { "content-type": "text/html" }, status: 429 // Too Many Requests
+                });
+            }
+            // --- End of Rate Limiting Check ---
+
+
             user = await getUser(loginUserId);
 
-            // Check if user exists.
             if (!user) {
+                 // If user not found, record a failed attempt before returning error.
+                 const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
+                 await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
                 return new Response(loginFormHTML("Invalid username or password."), {
                     headers: { "content-type": "text/html" }, status: 401
                 });
             }
 
-            // --- Secure Password Handling: Compare password against the stored hash ---
-            // Use bcrypt.compare to securely verify the submitted password against the stored hash.
-            const passwordMatch = await bcrypt.compare(password, user.password_hash);
+            // --- Password Verification: Compare password against the stored hash ---
+            const passwordMatch = await verifyPassword(password, user.password_hash);
 
-            // If passwords do not match, return an error.
             if (!passwordMatch) {
+                // If password doesn't match, record a failed attempt before returning error.
+                 const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
+                 await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
                 return new Response(loginFormHTML("Invalid username or password."), {
                     headers: { "content-type": "text/html" }, status: 401
                 });
             }
-             // --- End of Secure Handling ---
+             // --- End of Password Verification ---
 
-            // Check for monthly allocation on first login of the month.
-            // If enough time has passed since the last allocation, add the basic allocation.
+            // If login is successful, clear any failed attempt records for this user.
+            await clearFailedAttempts(loginUserId);
+
+
             if (Date.now() - user.last_allocation_timestamp > ONE_MONTH_MS) {
                 user.balance_parts += BASIC_ALLOCATION_PARTS;
                 user.last_allocation_timestamp = Date.now();
-                await saveUser(user.id, user); // Save the updated user data.
-                await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation'); // Record the allocation transaction.
-                allocationMessage = "Monthly allowance received!"; // Set message for dashboard display.
+                await saveUser(user.id, user);
+                await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
+                allocationMessage = "Monthly allowance received!";
             }
 
-            // Set a cookie to keep the user logged in for this demo session.
             const headers = new Headers();
             headers.set("content-type", "text/html");
             headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
 
-             // Redirect to the dashboard after successful login.
-             // Pass the allocation message via URL parameter for simplicity in this demo.
              const redirectUrl = new URL('/dashboard', req.url);
              if(allocationMessage) redirectUrl.searchParams.set('msg', encodeURIComponent(allocationMessage));
              return Response.redirect(redirectUrl.toString(), 302);
 
         } catch (error) {
-             // Catch any errors during login process (KV, bcrypt, etc.)
-            console.error("Error during login:", error);
+             console.error("Error during login:", error);
             return new Response(htmlLayout("Error", `
                 <p class="error">An internal server error occurred during login. Please try again later.</p>
                 <p><a href="/login">Back to Login</a></p>
             `), {
                 headers: { "content-type": "text/html" },
-                status: 500 // Internal Server Error
+                status: 500
             });
         }
 
 
     } else if (url.pathname === "/logout" && req.method === "GET") {
-        // Handle user logout by clearing the cookie and redirecting to home.
         const headers = new Headers();
-        headers.set("Set-Cookie", `user_id=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`); // Clear the user_id cookie.
-        headers.set("location", "/"); // Redirect to the home page.
+        headers.set("Set-Cookie", `user_id=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`);
+        headers.set("location", "/");
         return new Response(null, { status: 302, headers });
 
     } else if (url.pathname === "/dashboard" && req.method === "GET") {
-        // Serve the user dashboard. Redirect to login if not logged in.
         if (!user) return Response.redirect(new URL('/login', req.url).toString(), 302);
 
         try {
-            // Fetch the user's transaction history for the "Transaction River".
             const transactions = await getUserTransactions(user.id);
 
-            // Check for allocation message passed from login redirect URL parameter.
             const msg = url.searchParams.get('msg');
             if (msg) allocationMessage = decodeURIComponent(msg);
 
-            // Serve the dashboard HTML with user data and transactions.
             return new Response(dashboardHTML(user, transactions, allocationMessage), {
                 headers: { "content-type": "text/html" },
             });
         } catch (error) {
-             // Catch any errors fetching transactions.
-            console.error("Error fetching transactions:", error);
+             console.error("Error fetching transactions:", error);
              return new Response(htmlLayout("Error", `
                 <p class="error">An internal server error occurred while loading your dashboard.</p>
                 <p><a href="/">Go to Home</a></p>
             `), {
                 headers: { "content-type": "text/html" },
-                status: 500 // Internal Server Error
+                status: 500
             });
         }
 
 
     } else if (url.pathname === "/send" && req.method === "POST") {
-        // Handle sending tokens between users. Redirect to login if not logged in.
         if (!user) return Response.redirect(new URL('/login', req.url).toString(), 302);
 
         const formData = await req.formData();
         const recipientUsername = formData.get("recipientUsername")?.toString();
         const amountUnits = parseFloat(formData.get("amountUnits")?.toString() || '0');
-        // Convert the amount from units to the smallest unit (parts).
         const amountParts = Math.round(amountUnits * UNITS_TO_PARTS_MULTIPLIER);
 
         let message = "";
         let success = false;
 
-        // Validate recipient and amount.
         if (!recipientUsername || amountUnits <= 0 || !Number.isInteger(amountParts) || amountParts <= 0) {
             message = "Invalid recipient or amount.";
         } else {
@@ -456,20 +544,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
                 const recipientUserId = generateUserId(recipientUsername);
                 const recipient = await getUser(recipientUserId);
 
-                // Check if recipient exists.
                 if (!recipient) {
                     message = `Recipient '${recipientUsername}' not found.`;
                 }
-                // Check if sender has sufficient balance.
                 else if (user.balance_parts < amountParts) {
                     message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
                 } else {
-                    // --- Perform the Token Transfer ---
-                    // Deduct from sender and add to recipient.
                     user.balance_parts -= amountParts;
                     recipient.balance_parts += amountParts;
 
-                    // Use a KV atomic transaction to ensure both balance updates succeed or fail together.
                     const ok = await kv.atomic()
                         .mutate(
                             { key: ["users", user.id], value: user },
@@ -478,30 +561,25 @@ Deno.serve(async (req: Request): Promise<Response> => {
                         .commit();
 
                     if (ok.ok) {
-                        // If the atomic update was successful, record the transaction for both users.
                         await recordTransaction(user.id, recipient.id, amountParts, 'send');
                         message = `Successfully sent ${amountUnits.toFixed(3)} units to ${recipientUsername}.`;
                         success = true;
                     } else {
-                        // Handle atomic commit failure.
                         message = "Transaction failed (atomic commit error).";
                     }
                 }
             } catch (error) {
-                 // Catch any errors during send process (KV, etc.)
-                console.error("Error during send:", error);
+                 console.error("Error during send:", error);
                 message = "An internal server error occurred during the transaction.";
             }
         }
 
-        // Serve the result page indicating success or failure of the send operation.
         return new Response(sendResultHTML(message, success, user), {
             headers: { "content-type": "text/html" },
         });
 
 
     } else {
-        // Handle 404 Not Found for any other requested paths.
         return new Response(htmlLayout("Not Found", `
             <p>The page you requested could not be found.</p>
             <p><a href="/">Go to Home</a></p>
@@ -511,4 +589,3 @@ Deno.serve(async (req: Request): Promise<Response> => {
         });
     }
 });
-
