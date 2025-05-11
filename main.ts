@@ -346,11 +346,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
         const confirmPassword = formData.get("confirm_password")?.toString();
 
         if (!username || !password || !confirmPassword) {
+             console.log("Signup Error: Missing username, password, or confirmation");
              return new Response(signupFormHTML("Username, password, and confirmation are required."), {
                 headers: { "content-type": "text/html" }, status: 400
             });
         }
          if (password !== confirmPassword) {
+             console.log("Signup Error: Passwords do not match");
              return new Response(signupFormHTML("Passwords do not match."), {
                 headers: { "content-type": "text/html" }, status: 400
             });
@@ -362,6 +364,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
             const existingUser = await getUser(newUserId);
 
             if (existingUser) {
+                 console.log(`Signup Error: Username '${username}' already exists`);
                  return new Response(signupFormHTML(`Username '${username}' already exists.`), {
                     headers: { "content-type": "text/html" }, status: 400
                 });
@@ -370,6 +373,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
             // --- Password Handling: Generate Salt and Hash using SHA-256 ---
             const salt = await generateSalt();
             const hashedPassword = await hashPassword(password, salt);
+            console.log("Signup: Password hashed successfully");
             // --- End of Password Handling ---
 
             user = {
@@ -380,12 +384,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
                 last_allocation_timestamp: Date.now(),
             };
             await saveUser(user.id, user);
+            console.log(`Signup: User '${username}' saved to KV`);
 
             await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
+            console.log(`Signup: Initial allocation recorded for '${username}'`);
 
             const headers = new Headers();
             headers.set("content-type", "text/html");
             headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
+            console.log(`Signup: Cookie set for '${username}'. Redirecting to dashboard.`);
 
              return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
@@ -408,39 +415,48 @@ Deno.serve(async (req: Request): Promise<Response> => {
         });
 
     } else if (url.pathname === "/login" && req.method === "POST") {
-         if (user) return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
+         if (user) {
+             console.log("Login POST: User already logged in, redirecting to dashboard.");
+             return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
+         }
 
         const formData = await req.formData();
         const username = formData.get("username")?.toString();
         const password = formData.get("password")?.toString();
 
         if (!username || !password) {
+             console.log("Login POST Error: Missing username or password");
              return new Response(loginFormHTML("Username and password are required."), {
                 headers: { "content-type": "text/html" }, status: 400
             });
         }
 
         const loginUserId = generateUserId(username);
+        console.log(`Login POST: Attempting login for user ID: ${loginUserId}`);
 
         try {
             // --- Rate Limiting Check ---
+            console.log("Login POST: Checking rate limit...");
             const delayMessage = await enforceDelay(loginUserId);
             if (delayMessage) {
+                 console.log(`Login POST: Rate limit enforced for ${loginUserId}. Message: ${delayMessage}`);
                  // If a delay is enforced, record the failed attempt and return the message.
-                 // Note: Recording failed attempts happens *after* checking delay to avoid
-                 // immediately increasing delay for the current request if it's already delayed.
                  const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
                  await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
                  return new Response(loginFormHTML(delayMessage), {
                     headers: { "content-type": "text/html" }, status: 429 // Too Many Requests
                 });
             }
+            console.log("Login POST: Rate limit check passed.");
             // --- End of Rate Limiting Check ---
 
 
             user = await getUser(loginUserId);
+            console.log(`Login POST: User data fetched for ${loginUserId}:`, user ? 'Found' : 'Not Found');
+
 
             if (!user) {
+                 console.log(`Login POST Error: User '${username}' not found.`);
                  // If user not found, record a failed attempt before returning error.
                  const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
                  await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
@@ -450,9 +466,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
             }
 
             // --- Password Verification: Compare password against the stored hash ---
+            console.log("Login POST: Verifying password...");
             const passwordMatch = await verifyPassword(password, user.password_hash);
+            console.log(`Login POST: Password match result: ${passwordMatch}`);
 
             if (!passwordMatch) {
+                console.log(`Login POST Error: Password mismatch for user '${username}'.`);
                 // If password doesn't match, record a failed attempt before returning error.
                  const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
                  await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
@@ -463,26 +482,34 @@ Deno.serve(async (req: Request): Promise<Response> => {
              // --- End of Password Verification ---
 
             // If login is successful, clear any failed attempt records for this user.
+            console.log(`Login POST: Login successful for user '${username}'. Clearing failed attempts.`);
             await clearFailedAttempts(loginUserId);
 
 
             // Check for monthly allocation on first login of the month.
             if (Date.now() - user.last_allocation_timestamp > ONE_MONTH_MS) {
+                console.log(`Login POST: Monthly allocation due for user '${username}'.`);
                 user.balance_parts += BASIC_ALLOCATION_PARTS;
                 user.last_allocation_timestamp = Date.now();
                 await saveUser(user.id, user);
                 await recordTransaction("system", user.id, BASIC_ALLOCATION_PARTS, 'allocation');
                 allocationMessage = "Monthly allowance received!";
+                 console.log(`Login POST: Monthly allocation granted and recorded for '${username}'.`);
+            } else {
+                 console.log(`Login POST: Monthly allocation not due for user '${username}'.`);
             }
 
             // Set a cookie to keep the user logged in for this demo session.
             const headers = new Headers();
             headers.set("content-type", "text/html");
             headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
+            console.log(`Login POST: Cookie set for user '${username}'.`);
+
 
              const redirectUrl = new URL('/dashboard', req.url);
              if(allocationMessage) redirectUrl.searchParams.set('msg', encodeURIComponent(allocationMessage));
              // --- Successful Login: Redirect to Dashboard ---
+             console.log(`Login POST: Redirecting to dashboard for user '${username}'.`);
              return Response.redirect(redirectUrl.toString(), 302);
              // --- End of Redirect ---
 
@@ -499,16 +526,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
 
     } else if (url.pathname === "/logout" && req.method === "GET") {
+        console.log("Logout: Clearing cookie and redirecting to home.");
         const headers = new Headers();
         headers.set("Set-Cookie", `user_id=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT`);
         headers.set("location", "/");
         return new Response(null, { status: 302, headers });
 
     } else if (url.pathname === "/dashboard" && req.method === "GET") {
-        if (!user) return Response.redirect(new URL('/login', req.url).toString(), 302);
+        if (!user) {
+            console.log("Dashboard GET: Not logged in, redirecting to login.");
+            return Response.redirect(new URL('/login', req.url).toString(), 302);
+        }
+        console.log(`Dashboard GET: User '${user.username}' accessing dashboard.`);
 
         try {
             const transactions = await getUserTransactions(user.id);
+            console.log(`Dashboard GET: Fetched ${transactions.length} transactions for '${user.username}'.`);
 
             const msg = url.searchParams.get('msg');
             if (msg) allocationMessage = decodeURIComponent(msg);
@@ -529,7 +562,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
 
     } else if (url.pathname === "/send" && req.method === "POST") {
-        if (!user) return Response.redirect(new URL('/login', req.url).toString(), 302);
+        if (!user) {
+             console.log("Send POST: Not logged in, redirecting to login.");
+             return Response.redirect(new URL('/login', req.url).toString(), 302);
+        }
+         console.log(`Send POST: User '${user.username}' attempting to send tokens.`);
 
         const formData = await req.formData();
         const recipientUsername = formData.get("recipientUsername")?.toString();
@@ -541,17 +578,25 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
         if (!recipientUsername || amountUnits <= 0 || !Number.isInteger(amountParts) || amountParts <= 0) {
             message = "Invalid recipient or amount.";
+             console.log(`Send POST Error: ${message}`);
         } else {
             try {
                 const recipientUserId = generateUserId(recipientUsername);
+                 console.log(`Send POST: Recipient user ID: ${recipientUserId}`);
                 const recipient = await getUser(recipientUserId);
+                 console.log(`Send POST: Recipient data fetched:`, recipient ? 'Found' : 'Not Found');
+
 
                 if (!recipient) {
                     message = `Recipient '${recipientUsername}' not found.`;
+                     console.log(`Send POST Error: ${message}`);
                 }
                 else if (user.balance_parts < amountParts) {
                     message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
+                     console.log(`Send POST Error: ${message}`);
                 } else {
+                    // --- Perform the Token Transfer ---
+                    console.log(`Send POST: Attempting atomic transfer of ${amountParts} parts from '${user.username}' to '${recipientUsername}'.`);
                     user.balance_parts -= amountParts;
                     recipient.balance_parts += amountParts;
 
@@ -561,13 +606,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
                             { key: ["users", recipient.id], value: recipient }
                         )
                         .commit();
+                    console.log(`Send POST: Atomic commit result: ${ok.ok}`);
+
 
                     if (ok.ok) {
                         await recordTransaction(user.id, recipient.id, amountParts, 'send');
                         message = `Successfully sent ${amountUnits.toFixed(3)} units to ${recipientUsername}.`;
                         success = true;
+                         console.log(`Send POST: Transaction successful: ${message}`);
                     } else {
                         message = "Transaction failed (atomic commit error).";
+                         console.log(`Send POST Error: ${message}`);
                     }
                 }
             } catch (error) {
@@ -582,6 +631,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
 
     } else {
+        console.log(`Handler: 404 Not Found for path: ${url.pathname}`);
         return new Response(htmlLayout("Not Found", `
             <p>The page you requested could not be found.</p>
             <p><a href="/">Go to Home</a></p>
