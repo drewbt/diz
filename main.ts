@@ -106,7 +106,7 @@ async function verifyPassword(password: string, storedSaltAndHash: string): Prom
         const passwordBytes = textEncoder.encode(password);
         const saltedPassword = new Uint8Array(salt.length + passwordBytes.length);
         saltedPassword.set(salt, 0);
-        saltedPassword.set(passwordBytes, salt.length);
+saltedPassword.set(passwordBytes, salt.length);
 
         const hashBuffer = await crypto.subtle.digest('SHA-256', saltedPassword);
 
@@ -441,6 +441,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
             if (delayMessage) {
                  console.log(`Login POST: Rate limit enforced for ${loginUserId}. Message: ${delayMessage}`);
                  // If a delay is enforced, record the failed attempt and return the message.
+                 // Note: Recording failed attempts happens *after* checking delay to avoid
+                 // immediately increasing delay for the current request if it's already delayed.
                  const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
                  await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
                  return new Response(loginFormHTML(delayMessage), {
