@@ -427,6 +427,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
             const delayMessage = await enforceDelay(loginUserId);
             if (delayMessage) {
                  // If a delay is enforced, record the failed attempt and return the message.
+                 // Note: Recording failed attempts happens *after* checking delay to avoid
+                 // immediately increasing delay for the current request if it's already delayed.
                  const failedAttempts = await getFailedAttempts(loginUserId) || { count: 0, lastAttempt: 0 };
                  await setFailedAttempts(loginUserId, failedAttempts.count + 1, Date.now());
                  return new Response(loginFormHTML(delayMessage), {
@@ -464,6 +466,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
             await clearFailedAttempts(loginUserId);
 
 
+            // Check for monthly allocation on first login of the month.
             if (Date.now() - user.last_allocation_timestamp > ONE_MONTH_MS) {
                 user.balance_parts += BASIC_ALLOCATION_PARTS;
                 user.last_allocation_timestamp = Date.now();
@@ -472,13 +475,16 @@ Deno.serve(async (req: Request): Promise<Response> => {
                 allocationMessage = "Monthly allowance received!";
             }
 
+            // Set a cookie to keep the user logged in for this demo session.
             const headers = new Headers();
             headers.set("content-type", "text/html");
             headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
 
              const redirectUrl = new URL('/dashboard', req.url);
              if(allocationMessage) redirectUrl.searchParams.set('msg', encodeURIComponent(allocationMessage));
+             // --- Successful Login: Redirect to Dashboard ---
              return Response.redirect(redirectUrl.toString(), 302);
+             // --- End of Redirect ---
 
         } catch (error) {
              console.error("Error during login:", error);
@@ -544,7 +550,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
                     message = `Recipient '${recipientUsername}' not found.`;
                 }
                 else if (user.balance_parts < amountParts) {
-                    message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARIFIER).toFixed(3)} units.`;
+                    message = `Insufficient balance. You have ${(user.balance_parts / UNITS_TO_PARTS_MULTIPLIER).toFixed(3)} units.`;
                 } else {
                     user.balance_parts -= amountParts;
                     recipient.balance_parts += amountParts;
