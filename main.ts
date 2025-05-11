@@ -321,9 +321,17 @@ function sendResultHTML(message: string, success: boolean, user: any): string {
 Deno.serve(async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
 
+    // Added logging to see the incoming cookie header
+    console.log(`Incoming Request: ${req.method} ${url.pathname}`);
+    console.log(`Incoming Cookie Header: ${req.headers.get("cookie")}`);
+
     let userId = req.headers.get("cookie")?.split('; ').find(row => row.startsWith('user_id='))?.split('=')[1];
     let user = userId ? await getUser(userId) : null;
     let allocationMessage: string | null = null;
+
+    // Log the user status at the start of the handler
+    console.log(`Handler: User ID from cookie: ${userId}`);
+    console.log(`Handler: User object from KV: ${user ? 'Found' : 'Not Found'}`);
 
 
     if (url.pathname === "/" && req.method === "GET") {
@@ -391,8 +399,10 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
             const headers = new Headers();
             headers.set("content-type", "text/html");
-            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
-            console.log(`Signup: Cookie set for '${username}'. Redirecting to dashboard.`);
+            // Ensure the cookie is set correctly
+            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly; SameSite=Lax`); // Added SameSite=Lax
+            console.log(`Signup: Set-Cookie header: user_id=${user.id}; Path=/; HttpOnly; SameSite=Lax`);
+
 
              return Response.redirect(new URL('/dashboard', req.url).toString(), 302);
 
@@ -504,8 +514,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
             // Set a cookie to keep the user logged in for this demo session.
             const headers = new Headers();
             headers.set("content-type", "text/html");
-            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly`);
-            console.log(`Login POST: Cookie set for user '${username}'.`);
+            // Ensure the cookie is set correctly
+            headers.set("Set-Cookie", `user_id=${user.id}; Path=/; HttpOnly; SameSite=Lax`); // Added SameSite=Lax
+            console.log(`Login POST: Set-Cookie header: user_id=${user.id}; Path=/; HttpOnly; SameSite=Lax`);
 
 
              const redirectUrl = new URL('/dashboard', req.url);
@@ -535,8 +546,9 @@ Deno.serve(async (req: Request): Promise<Response> => {
         return new Response(null, { status: 302, headers });
 
     } else if (url.pathname === "/dashboard" && req.method === "GET") {
+        console.log(`Dashboard GET: Accessing dashboard. User ID from cookie: ${userId}`);
         if (!user) {
-            console.log("Dashboard GET: Not logged in, redirecting to login.");
+            console.log("Dashboard GET: User object not found, redirecting to login.");
             return Response.redirect(new URL('/login', req.url).toString(), 302);
         }
         console.log(`Dashboard GET: User '${user.username}' accessing dashboard.`);
